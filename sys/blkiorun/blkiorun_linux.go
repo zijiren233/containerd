@@ -39,27 +39,27 @@ import (
 )
 
 const (
-	// BFQ IO weight range: 10-1000
-	bfqWeightMin = 10
-	bfqWeightMax = 1000
+	// DefaultSliceName is the default systemd slice name
+	DefaultSliceName = "containerdio.slice"
 
-	// io.weight range: 1-10000
-	ioWeightMax = 10000
+	// SystemdTimeout is the timeout for systemd operations
+	SystemdTimeout = 5 * time.Second
 
-	// Default normal BFQ weight
-	normalBFQWeight = 100
+	// sliceWaitRetries is the number of retries when waiting for slice creation
+	sliceWaitRetries = 10
 
-	// Default systemd slice name
-	defaultSliceName = "containerdio.slice"
-
-	// Timeout for systemd operations
-	systemdTimeout = 5 * time.Second
+	// sliceWaitInterval is the interval between retries
+	sliceWaitInterval = 100 * time.Millisecond
 )
 
 var (
 	state     *globalState
 	stateOnce sync.Once
 	counter   uint64
+
+	// BFQ support detection
+	bfqSupported     bool
+	bfqSupportedOnce sync.Once
 
 	// ErrNotInitialized is returned when blkiorun is not initialized
 	ErrNotInitialized = errors.New("blkiorun not initialized, call Init first")
@@ -69,35 +69,35 @@ var (
 type globalState struct {
 	slicePath      string // cgroup path for the slice
 	containerdPath string // containerd's cgroup path
-	weight         uint16 // configured weight
+	config         Config // runtime config
 	initialized    bool
 }
 
 // Init initializes block IO weight control for containerd.
 // Parameters:
-// - weight: IO weight value (10-1000). Set to 0 to disable.
+// - cfg: Runtime config containing IO weight (10-1000). Set weight to 0 to disable.
 // - slicePath: Path to existing cgroup (optional, uses systemd if empty)
 // - sliceName: Systemd slice name (default: "containerdio.slice")
-func Init(weight int, slicePath, sliceName string) error {
+func Init(cfg Config, slicePath, sliceName string) error {
 	var initErr error
 
 	stateOnce.Do(func() {
 		s := &globalState{}
 
-		if weight <= 0 {
+		if cfg.Weight == 0 {
 			log.L.Debug("blkiorun: disabled (weight=0)")
 			state = s
 			return
 		}
 
-		if weight < bfqWeightMin || weight > bfqWeightMax {
-			log.L.Warnf("blkiorun: weight %d out of range [%d, %d], disabled", weight, bfqWeightMin, bfqWeightMax)
+		if cfg.Weight < BFQWeightMin || cfg.Weight > BFQWeightMax {
+			log.L.Warnf("blkiorun: weight %d out of range [%d, %d], disabled", cfg.Weight, BFQWeightMin, BFQWeightMax)
 			state = s
 			return
 		}
 
-		s.weight = uint16(weight)
-		log.L.Infof("blkiorun: weight configured: %d", weight)
+		s.config = cfg
+		log.L.Infof("blkiorun: weight configured: %d", cfg.Weight)
 
 		if !isCgroupV2() {
 			log.L.Warn("blkiorun: cgroups v2 not available, disabled")
@@ -122,13 +122,13 @@ func Init(weight int, slicePath, sliceName string) error {
 		} else {
 			// Create systemd slice
 			if sliceName == "" {
-				sliceName = defaultSliceName
+				sliceName = DefaultSliceName
 			}
 			if !strings.HasSuffix(sliceName, ".slice") {
 				sliceName += ".slice"
 			}
 
-			ctx, cancel := context.WithTimeout(context.Background(), systemdTimeout)
+			ctx, cancel := context.WithTimeout(context.Background(), SystemdTimeout)
 			defer cancel()
 
 			if err := createSlice(ctx, sliceName); err != nil {
@@ -138,11 +138,11 @@ func Init(weight int, slicePath, sliceName string) error {
 			}
 
 			cgroupPath = sliceCgroupPath(sliceName)
-			for i := 0; i < 10; i++ {
+			for i := 0; i < sliceWaitRetries; i++ {
 				if _, err := os.Stat(cgroupPath); err == nil {
 					break
 				}
-				time.Sleep(100 * time.Millisecond)
+				time.Sleep(sliceWaitInterval)
 			}
 		}
 
@@ -160,10 +160,17 @@ func Init(weight int, slicePath, sliceName string) error {
 			return
 		}
 
+		// Apply default IO weight to slice
+		if err := applyConfig(cgroupPath, cfg); err != nil {
+			log.L.WithError(err).Warn("blkiorun: failed to apply config")
+			state = s
+			return
+		}
+
 		s.slicePath = cgroupPath
 		s.initialized = true
 		state = s
-		log.L.Infof("blkiorun: initialized at %s", cgroupPath)
+		log.L.Infof("blkiorun: initialized at %s with weight %d", cgroupPath, cfg.Weight)
 	})
 
 	return initErr
@@ -177,18 +184,11 @@ func IsInitialized() bool {
 // Go executes fn in a new goroutine with configured IO weight.
 // The OS thread is discarded after fn completes.
 func Go[T any](fn func() (T, error)) (T, error) {
-	if !IsInitialized() {
-		return fn()
-	}
-	return GoWithConfig(state.weight, fn)
+	return GoWithConfig(state.config, fn)
 }
 
-// GoWithConfig executes fn in a new goroutine with specified IO weight.
-func GoWithConfig[T any](weight uint16, fn func() (T, error)) (T, error) {
-	if weight == 0 || !IsInitialized() {
-		return fn()
-	}
-
+// GoWithConfig executes fn in a new goroutine with specified config.
+func GoWithConfig[T any](cfg Config, fn func() (T, error)) (T, error) {
 	type result struct {
 		value T
 		err   error
@@ -196,28 +196,7 @@ func GoWithConfig[T any](weight uint16, fn func() (T, error)) (T, error) {
 
 	ch := make(chan result, 1)
 	go func() {
-		runtime.LockOSThread()
-
-		cg, err := createCgroup(weight)
-		if err != nil {
-			log.L.WithError(err).Debug("blkiorun: failed to create cgroup")
-			v, err := fn()
-			ch <- result{v, err}
-			return
-		}
-		defer func() {
-			cg.leave()
-			cg.destroy()
-		}()
-
-		if err := cg.enter(); err != nil {
-			log.L.WithError(err).Debug("blkiorun: failed to enter cgroup")
-			v, err := fn()
-			ch <- result{v, err}
-			return
-		}
-
-		v, err := fn()
+		v, err := LocalWithConfig(cfg, fn)
 		ch <- result{v, err}
 	}()
 
@@ -227,35 +206,30 @@ func GoWithConfig[T any](weight uint16, fn func() (T, error)) (T, error) {
 
 // Local executes fn in current goroutine with configured IO weight.
 func Local[T any](fn func() (T, error)) (T, error) {
-	if !IsInitialized() {
-		return fn()
-	}
-	return LocalWithConfig(state.weight, fn)
+	return LocalWithConfig(state.config, fn)
 }
 
-// LocalWithConfig executes fn in current goroutine with specified IO weight.
-func LocalWithConfig[T any](weight uint16, fn func() (T, error)) (T, error) {
-	if weight == 0 || !IsInitialized() {
+// LocalWithConfig executes fn in current goroutine with specified config.
+func LocalWithConfig[T any](cfg Config, fn func() (T, error)) (T, error) {
+	if cfg.Weight == 0 || !IsInitialized() {
 		return fn()
 	}
 
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
-	cg, err := createCgroup(weight)
+	cg, err := createCgroup(cfg)
 	if err != nil {
 		log.L.WithError(err).Debug("blkiorun: failed to create cgroup")
 		return fn()
 	}
-	defer func() {
-		cg.leave()
-		cg.destroy()
-	}()
+	defer cg.destroy()
 
 	if err := cg.enter(); err != nil {
 		log.L.WithError(err).Debug("blkiorun: failed to enter cgroup")
 		return fn()
 	}
+	defer cg.leave()
 
 	return fn()
 }
@@ -265,7 +239,7 @@ type cgroup struct {
 	path string
 }
 
-func createCgroup(weight uint16) (*cgroup, error) {
+func createCgroup(cfg Config) (*cgroup, error) {
 	if state == nil || !state.initialized {
 		return nil, ErrNotInitialized
 	}
@@ -278,7 +252,7 @@ func createCgroup(weight uint16) (*cgroup, error) {
 	}
 
 	cg := &cgroup{path: path}
-	if err := cg.setWeight(weight); err != nil {
+	if err := applyConfig(cg.path, cfg); err != nil {
 		cg.destroy()
 		return nil, err
 	}
@@ -286,10 +260,72 @@ func createCgroup(weight uint16) (*cgroup, error) {
 	return cg, nil
 }
 
-func (cg *cgroup) setWeight(weight uint16) error {
-	// Convert BFQ weight to io.weight
-	ioWeight := 1 + (uint64(weight)-10)*9999/990
-	return os.WriteFile(filepath.Join(cg.path, "io.weight"), []byte(strconv.FormatUint(ioWeight, 10)), 0644)
+func applyConfig(path string, cfg Config) error {
+	if cfg.Weight > 0 {
+		return writeIOWeight(path, cfg.Weight)
+	}
+	return nil
+}
+
+// isBFQSupported checks if BFQ IO scheduler is available in the given cgroup path.
+func isBFQSupported(cgroupPath string) bool {
+	bfqSupportedOnce.Do(func() {
+		bfqPath := filepath.Join(cgroupPath, "io.bfq.weight")
+		if _, err := os.Stat(bfqPath); err == nil {
+			bfqSupported = true
+		}
+	})
+	return bfqSupported
+}
+
+// readIOWeight reads the current IO weight from cgroups.
+// Returns BFQ weight if available, otherwise io.weight converted to BFQ range.
+func readIOWeight(cgroupPath string) (uint16, error) {
+	// Try BFQ first
+	if isBFQSupported(cgroupPath) {
+		data, err := os.ReadFile(filepath.Join(cgroupPath, "io.bfq.weight"))
+		if err == nil {
+			fields := strings.Fields(string(bytes.TrimSpace(data)))
+			if len(fields) > 0 {
+				weight, err := strconv.ParseUint(fields[len(fields)-1], 10, 16)
+				if err == nil {
+					return uint16(weight), nil
+				}
+			}
+		}
+	}
+
+	// Fallback to io.weight
+	data, err := os.ReadFile(filepath.Join(cgroupPath, "io.weight"))
+	if err != nil {
+		return BFQWeightDefault, nil // Return default if reading fails
+	}
+
+	fields := strings.Fields(string(bytes.TrimSpace(data)))
+	if len(fields) > 0 {
+		ioWeight, err := strconv.ParseUint(fields[len(fields)-1], 10, 64)
+		if err == nil {
+			return ConvertIOWeightToBFQ(ioWeight), nil
+		}
+	}
+
+	return BFQWeightDefault, nil
+}
+
+// writeIOWeight writes IO weight to cgroups.
+// Uses io.bfq.weight if available, otherwise io.weight with conversion.
+func writeIOWeight(cgroupPath string, weight uint16) error {
+	// Try BFQ first
+	if isBFQSupported(cgroupPath) {
+		bfqPath := filepath.Join(cgroupPath, "io.bfq.weight")
+		if err := os.WriteFile(bfqPath, []byte(strconv.FormatUint(uint64(weight), 10)), 0644); err == nil {
+			return nil
+		}
+	}
+
+	// Fallback to io.weight with conversion
+	ioWeight := ConvertBFQToIOWeight(weight)
+	return os.WriteFile(filepath.Join(cgroupPath, "io.weight"), []byte(strconv.FormatUint(ioWeight, 10)), 0644)
 }
 
 func (cg *cgroup) enter() error {
@@ -367,7 +403,7 @@ func createSlice(ctx context.Context, name string) error {
 
 	select {
 	case <-ch:
-	case <-time.After(systemdTimeout):
+	case <-time.After(SystemdTimeout):
 	case <-ctx.Done():
 		return ctx.Err()
 	}

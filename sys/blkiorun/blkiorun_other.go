@@ -19,7 +19,7 @@
 package blkiorun
 
 // Init is a no-op on non-Linux platforms.
-func Init(weight int, slicePath, sliceName string) error {
+func Init(cfg Config, slicePath, sliceName string) error {
 	return nil
 }
 
@@ -34,7 +34,7 @@ func Go[T any](fn func() (T, error)) (T, error) {
 }
 
 // GoWithConfig simply executes fn on non-Linux platforms.
-func GoWithConfig[T any](weight uint16, fn func() (T, error)) (T, error) {
+func GoWithConfig[T any](cfg Config, fn func() (T, error)) (T, error) {
 	return fn()
 }
 
@@ -44,6 +44,6 @@ func Local[T any](fn func() (T, error)) (T, error) {
 }
 
 // LocalWithConfig simply executes fn on non-Linux platforms.
-func LocalWithConfig[T any](weight uint16, fn func() (T, error)) (T, error) {
+func LocalWithConfig[T any](cfg Config, fn func() (T, error)) (T, error) {
 	return fn()
 }
