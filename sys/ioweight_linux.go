@@ -27,6 +27,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
+
+	"github.com/containerd/log"
 )
 
 // IOWeightEnvKey is the environment variable key to set IO weight
@@ -59,6 +63,9 @@ var (
 	// 0 means not configured/disabled
 	configuredIOWeight     uint16
 	configuredIOWeightOnce sync.Once
+
+	// ioweightCgroupCounter is used to generate unique child cgroup names
+	ioweightCgroupCounter uint64
 )
 
 // getConfiguredIOWeight returns the configured IO weight from environment variable.
@@ -67,20 +74,24 @@ func getConfiguredIOWeight() uint16 {
 	configuredIOWeightOnce.Do(func() {
 		val := os.Getenv(IOWeightEnvKey)
 		if val == "" {
+			log.L.Debug("IO weight not configured via environment variable")
 			return
 		}
 
 		weight, err := strconv.ParseUint(val, 10, 16)
 		if err != nil {
+			log.L.WithError(err).Warnf("Invalid IO weight value: %s", val)
 			return
 		}
 
 		// Validate range
 		if weight < bfqWeightMin || weight > bfqWeightMax {
+			log.L.Warnf("IO weight %d out of valid range [%d, %d], ignoring", weight, bfqWeightMin, bfqWeightMax)
 			return
 		}
 
 		configuredIOWeight = uint16(weight)
+		log.L.Infof("IO weight configured: %d (from %s)", configuredIOWeight, IOWeightEnvKey)
 	})
 	return configuredIOWeight
 }
@@ -91,6 +102,9 @@ func isCgroupV2Enabled() bool {
 		// Check if cgroup2 filesystem is mounted at /sys/fs/cgroup
 		if stat, err := os.Stat("/sys/fs/cgroup/cgroup.controllers"); err == nil && !stat.IsDir() {
 			cgroupV2Enabled = true
+			log.L.Debug("cgroups v2 detected")
+		} else {
+			log.L.Debug("cgroups v2 not available")
 		}
 	})
 	return cgroupV2Enabled
@@ -105,12 +119,16 @@ func isBFQSupported() bool {
 
 		cgroupPath, err := getCurrentCgroupPath()
 		if err != nil {
+			log.L.WithError(err).Debug("Failed to get cgroup path for BFQ check")
 			return
 		}
 
 		bfqPath := filepath.Join(cgroupPath, "io.bfq.weight")
 		if _, err := os.Stat(bfqPath); err == nil {
 			bfqSupported = true
+			log.L.Debugf("BFQ IO scheduler supported at %s", bfqPath)
+		} else {
+			log.L.Debugf("BFQ IO scheduler not available, will use io.weight")
 		}
 	})
 	return bfqSupported
@@ -206,6 +224,7 @@ func writeIOWeight(weight uint16) error {
 	if isBFQSupported() {
 		bfqPath := filepath.Join(cgroupPath, "io.bfq.weight")
 		if err := os.WriteFile(bfqPath, []byte(strconv.FormatUint(uint64(weight), 10)), 0644); err == nil {
+			log.L.Debugf("Set io.bfq.weight to %d at %s", weight, bfqPath)
 			return nil
 		}
 	}
@@ -213,7 +232,12 @@ func writeIOWeight(weight uint16) error {
 	// Fallback to io.weight with conversion
 	ioWeight := convertBFQToIOWeight(weight)
 	ioWeightPath := filepath.Join(cgroupPath, "io.weight")
-	return os.WriteFile(ioWeightPath, []byte(strconv.FormatUint(ioWeight, 10)), 0644)
+	if err := os.WriteFile(ioWeightPath, []byte(strconv.FormatUint(ioWeight, 10)), 0644); err != nil {
+		log.L.WithError(err).Debugf("Failed to write io.weight at %s", ioWeightPath)
+		return err
+	}
+	log.L.Debugf("Set io.weight to %d (from BFQ weight %d) at %s", ioWeight, weight, ioWeightPath)
+	return nil
 }
 
 // convertBFQToIOWeight converts BFQ weight (10-1000) to io.weight (1-10000).
@@ -240,40 +264,177 @@ func convertIOWeightToBFQ(ioWeight uint64) uint16 {
 	return uint16(10 + (ioWeight-1)*990/9999)
 }
 
-// setIOWeightCgroupValue sets the current process's cgroup to use the specified IO weight.
-// Returns the original weight value, or 0 if operation failed.
-func setIOWeightCgroupValue(weight uint16) uint16 {
-	if weight == 0 {
-		return 0
-	}
-
-	origWeight, err := readIOWeight()
-	if err != nil {
-		return 0
-	}
-
-	// Set to specified weight
-	_ = writeIOWeight(weight)
-	return origWeight
+// ioWeightCgroup represents a child cgroup for IO weight control
+type ioWeightCgroup struct {
+	path         string // Full path to the child cgroup
+	originalPath string // Full path to the original cgroup (to return thread to)
 }
 
-// restoreIOWeightCgroup restores the cgroup IO weight to the specified value.
-func restoreIOWeightCgroup(weight uint16) {
-	if weight == 0 {
-		return
+// checkIOControllerEnabled checks if the io controller is enabled in a cgroup's subtree_control
+func checkIOControllerEnabled(cgroupPath string) bool {
+	subtreeControlPath := filepath.Join(cgroupPath, "cgroup.subtree_control")
+	data, err := os.ReadFile(subtreeControlPath)
+	if err != nil {
+		return false
 	}
-	_ = writeIOWeight(weight)
+	return strings.Contains(string(data), "io")
+}
+
+// findParentWithIOController finds a parent cgroup that has io controller enabled in subtree_control.
+// Due to cgroups v2 "no internal processes" constraint, we cannot enable subtree controllers
+// in a cgroup that has processes. So we look for a parent cgroup that already has io enabled.
+func findParentWithIOController(startPath string) (string, error) {
+	path := startPath
+	cgroupRoot := "/sys/fs/cgroup"
+
+	for path != cgroupRoot && path != "/" {
+		parentPath := filepath.Dir(path)
+		if checkIOControllerEnabled(parentPath) {
+			log.L.Debugf("Found parent with io controller enabled: %s", parentPath)
+			return parentPath, nil
+		}
+		path = parentPath
+	}
+
+	return "", errors.New("no parent cgroup with io controller enabled found")
+}
+
+// tryEnableIOController attempts to enable io controller in a cgroup's subtree_control.
+// Returns true if successful or already enabled, false if failed (e.g., due to processes in cgroup).
+func tryEnableIOController(cgroupPath string) bool {
+	if checkIOControllerEnabled(cgroupPath) {
+		return true
+	}
+	subtreeControlPath := filepath.Join(cgroupPath, "cgroup.subtree_control")
+	if err := os.WriteFile(subtreeControlPath, []byte("+io"), 0644); err != nil {
+		log.L.Debugf("Cannot enable io controller in %s: %v", cgroupPath, err)
+		return false
+	}
+	log.L.Debugf("Enabled io controller in %s", subtreeControlPath)
+	return true
+}
+
+// createIOWeightCgroup creates a child cgroup for IO weight control.
+// It first tries to create in the current cgroup (if io controller can be enabled),
+// otherwise falls back to a parent that already has io controller enabled.
+func createIOWeightCgroup(weight uint16) (*ioWeightCgroup, error) {
+	if !isCgroupV2Enabled() {
+		return nil, errors.New("cgroups v2 not enabled")
+	}
+
+	originalPath, err := getCurrentCgroupPath()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get current cgroup path: %w", err)
+	}
+
+	// First, try to enable io controller in current cgroup (works if Delegate= is configured)
+	var parentPath string
+	if tryEnableIOController(originalPath) {
+		parentPath = originalPath
+		log.L.Debugf("Using current cgroup as parent: %s", parentPath)
+	} else {
+		// Fall back to finding a parent cgroup that already has io controller enabled
+		parentPath, err = findParentWithIOController(originalPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to find parent with io controller: %w", err)
+		}
+	}
+
+	// Generate unique child cgroup name with process id to avoid conflicts
+	id := atomic.AddUint64(&ioweightCgroupCounter, 1)
+	childName := fmt.Sprintf("ioweight-%d-%d", os.Getpid(), id)
+	childPath := filepath.Join(parentPath, childName)
+
+	// Create the child cgroup directory
+	if err := os.Mkdir(childPath, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create child cgroup %s: %w", childPath, err)
+	}
+
+	log.L.Debugf("Created child cgroup: %s (will return to %s)", childPath, originalPath)
+
+	cg := &ioWeightCgroup{
+		path:         childPath,
+		originalPath: originalPath,
+	}
+
+	// Set IO weight on the child cgroup
+	if err := cg.setIOWeight(weight); err != nil {
+		// Clean up on failure
+		cg.destroy()
+		return nil, fmt.Errorf("failed to set IO weight on child cgroup: %w", err)
+	}
+
+	return cg, nil
+}
+
+// setIOWeight sets the IO weight on this cgroup
+func (cg *ioWeightCgroup) setIOWeight(weight uint16) error {
+	if weight < bfqWeightMin || weight > bfqWeightMax {
+		return fmt.Errorf("weight %d out of range [%d, %d]", weight, bfqWeightMin, bfqWeightMax)
+	}
+
+	// Try BFQ first
+	if isBFQSupported() {
+		bfqPath := filepath.Join(cg.path, "io.bfq.weight")
+		if err := os.WriteFile(bfqPath, []byte(strconv.FormatUint(uint64(weight), 10)), 0644); err == nil {
+			log.L.Debugf("Set io.bfq.weight to %d at %s", weight, bfqPath)
+			return nil
+		}
+	}
+
+	// Fallback to io.weight with conversion
+	ioWeight := convertBFQToIOWeight(weight)
+	ioWeightPath := filepath.Join(cg.path, "io.weight")
+	if err := os.WriteFile(ioWeightPath, []byte(strconv.FormatUint(ioWeight, 10)), 0644); err != nil {
+		return fmt.Errorf("failed to write io.weight: %w", err)
+	}
+	log.L.Debugf("Set io.weight to %d (from BFQ weight %d) at %s", ioWeight, weight, ioWeightPath)
+	return nil
+}
+
+// enter moves the current thread into this cgroup
+func (cg *ioWeightCgroup) enter() error {
+	tid := syscall.Gettid()
+	procsPath := filepath.Join(cg.path, "cgroup.procs")
+	if err := os.WriteFile(procsPath, []byte(strconv.Itoa(tid)), 0644); err != nil {
+		return fmt.Errorf("failed to move thread %d to cgroup %s: %w", tid, cg.path, err)
+	}
+	log.L.Debugf("Moved thread %d to child cgroup %s", tid, cg.path)
+	return nil
+}
+
+// leave moves the current thread back to the original cgroup
+func (cg *ioWeightCgroup) leave() error {
+	tid := syscall.Gettid()
+	procsPath := filepath.Join(cg.originalPath, "cgroup.procs")
+	if err := os.WriteFile(procsPath, []byte(strconv.Itoa(tid)), 0644); err != nil {
+		return fmt.Errorf("failed to move thread %d back to original cgroup %s: %w", tid, cg.originalPath, err)
+	}
+	log.L.Debugf("Moved thread %d back to original cgroup %s", tid, cg.originalPath)
+	return nil
+}
+
+// destroy removes this cgroup
+func (cg *ioWeightCgroup) destroy() {
+	if err := os.Remove(cg.path); err != nil {
+		log.L.WithError(err).Debugf("Failed to remove child cgroup %s", cg.path)
+	} else {
+		log.L.Debugf("Removed child cgroup %s", cg.path)
+	}
 }
 
 // RunWithIOWeightValue runs the given function in a dedicated OS thread
-// with the specified IO weight via cgroup io.weight/io.bfq.weight.
+// with the specified IO weight via a child cgroup with io.weight/io.bfq.weight.
 // If weight is 0, the function runs without IO weight adjustment.
 // This function blocks until fn completes.
 // The dedicated OS thread is terminated after fn returns.
+// A temporary child cgroup is created for the operation and cleaned up after completion.
 func RunWithIOWeightValue[T any](weight uint16, fn func() (T, error)) (T, error) {
 	if weight == 0 {
 		return fn()
 	}
+
+	log.L.Debugf("RunWithIOWeightValue: starting with weight=%d", weight)
 
 	type result struct {
 		value T
@@ -286,14 +447,36 @@ func RunWithIOWeightValue[T any](weight uint16, fn func() (T, error)) (T, error)
 		// we discard this OS thread after use
 		runtime.LockOSThread()
 
-		// Set specified IO weight via cgroups
-		_ = setIOWeightCgroupValue(weight)
+		// Create child cgroup with specified IO weight
+		cg, err := createIOWeightCgroup(weight)
+		if err != nil {
+			log.L.WithError(err).Debug("Failed to create IO weight cgroup, running without IO weight control")
+			v, err := fn()
+			resCh <- result{value: v, err: err}
+			return
+		}
+		defer func() {
+			// Leave the child cgroup and destroy it
+			if err := cg.leave(); err != nil {
+				log.L.WithError(err).Debug("Failed to leave child cgroup")
+			}
+			cg.destroy()
+		}()
+
+		// Enter the child cgroup
+		if err := cg.enter(); err != nil {
+			log.L.WithError(err).Debug("Failed to enter child cgroup, running without IO weight control")
+			v, err := fn()
+			resCh <- result{value: v, err: err}
+			return
+		}
 
 		v, err := fn()
 		resCh <- result{value: v, err: err}
 	}()
 
 	res := <-resCh
+	log.L.Debugf("RunWithIOWeightValue: completed with weight=%d", weight)
 	return res.value, res.err
 }
 
@@ -306,8 +489,8 @@ func RunWithIOWeight[T any](fn func() (T, error)) (T, error) {
 }
 
 // LocalRunWithIOWeightValue locks the current goroutine to its OS thread,
-// sets the specified IO weight via cgroup io.weight/io.bfq.weight, runs the function,
-// restores the original IO weight, and then unlocks the thread.
+// creates a child cgroup with the specified IO weight, moves the thread into it,
+// runs the function, moves the thread back, and destroys the child cgroup.
 // If weight is 0, the function runs without IO weight adjustment.
 // This ensures the IO weight setting only affects the current goroutine
 // and doesn't leak to other goroutines that might later use the same thread.
@@ -324,12 +507,31 @@ func LocalRunWithIOWeightValue[T any](weight uint16, fn func() (T, error)) (T, e
 		return fn()
 	}
 
+	log.L.Debugf("LocalRunWithIOWeightValue: starting with weight=%d", weight)
+
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
-	// Set specified IO weight via cgroups and restore on exit
-	origWeight := setIOWeightCgroupValue(weight)
-	defer restoreIOWeightCgroup(origWeight)
+	// Create child cgroup with specified IO weight
+	cg, err := createIOWeightCgroup(weight)
+	if err != nil {
+		log.L.WithError(err).Debug("Failed to create IO weight cgroup, running without IO weight control")
+		return fn()
+	}
+	defer func() {
+		// Leave the child cgroup and destroy it
+		if err := cg.leave(); err != nil {
+			log.L.WithError(err).Debug("Failed to leave child cgroup")
+		}
+		cg.destroy()
+		log.L.Debugf("LocalRunWithIOWeightValue: completed with weight=%d", weight)
+	}()
+
+	// Enter the child cgroup
+	if err := cg.enter(); err != nil {
+		log.L.WithError(err).Debug("Failed to enter child cgroup, running without IO weight control")
+		return fn()
+	}
 
 	return fn()
 }

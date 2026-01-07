@@ -17,12 +17,48 @@
 package sys
 
 import (
+	"bytes"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 )
+
+// readIOWeightFromPath reads IO weight directly from a specific cgroup path
+func readIOWeightFromPath(cgroupPath string) (uint16, error) {
+	// Try BFQ first
+	if isBFQSupported() {
+		data, err := os.ReadFile(filepath.Join(cgroupPath, "io.bfq.weight"))
+		if err == nil {
+			fields := strings.Fields(string(bytes.TrimSpace(data)))
+			if len(fields) > 0 {
+				weight, err := strconv.ParseUint(fields[len(fields)-1], 10, 16)
+				if err == nil {
+					return uint16(weight), nil
+				}
+			}
+		}
+	}
+
+	// Fallback to io.weight
+	data, err := os.ReadFile(filepath.Join(cgroupPath, "io.weight"))
+	if err != nil {
+		return normalBFQWeight, nil
+	}
+
+	fields := strings.Fields(string(bytes.TrimSpace(data)))
+	if len(fields) > 0 {
+		ioWeight, err := strconv.ParseUint(fields[len(fields)-1], 10, 64)
+		if err == nil {
+			return convertIOWeightToBFQ(ioWeight), nil
+		}
+	}
+
+	return normalBFQWeight, nil
+}
 
 func TestConvertBFQToIOWeight(t *testing.T) {
 	tests := []struct {
@@ -219,55 +255,49 @@ func TestIOWeightSetAndRestore(t *testing.T) {
 	assert.Equal(t, originalWeight, restoredWeight, "IO weight should be restored to the original value")
 }
 
-// TestSetAndRestoreIOWeightCgroupValue tests the setIOWeightCgroupValue and restoreIOWeightCgroup functions
-func TestSetAndRestoreIOWeightCgroupValue(t *testing.T) {
+// TestCreateIOWeightCgroup tests the createIOWeightCgroup function
+func TestCreateIOWeightCgroup(t *testing.T) {
 	if !isCgroupV2Enabled() {
 		t.Skip("Test requires cgroups v2")
 	}
 
-	// Read the original weight first
-	originalWeight, err := readIOWeight()
+	// Get the current cgroup path
+	parentPath, err := getCurrentCgroupPath()
 	if err != nil {
-		t.Skipf("Cannot read IO weight: %v", err)
+		t.Skipf("Cannot get current cgroup path: %v", err)
 	}
+	t.Logf("Parent cgroup path: %s", parentPath)
 
-	t.Logf("Original IO weight: %d", originalWeight)
-
-	// Test that we can write IO weight first
-	testErr := writeIOWeight(150)
-	if testErr != nil {
-		t.Skipf("Cannot write IO weight (need permissions): %v", testErr)
-	}
-
-	// Call setIOWeightCgroupValue
-	returnedWeight := setIOWeightCgroupValue(150)
-	if returnedWeight == 0 {
-		t.Skipf("setIOWeightCgroupValue failed (may need permissions or BFQ scheduler)")
-	}
-
-	t.Logf("setIOWeightCgroupValue returned: %d", returnedWeight)
-	assert.Equal(t, originalWeight, returnedWeight, "setIOWeightCgroupValue should return the original weight")
-
-	// Verify the weight was changed
-	currentWeight, err := readIOWeight()
+	// Create a child cgroup with weight 150
+	cg, err := createIOWeightCgroup(150)
 	if err != nil {
-		t.Fatalf("Failed to read IO weight after setting: %v", err)
+		t.Skipf("Cannot create child cgroup (need permissions): %v", err)
 	}
 
-	t.Logf("Current IO weight after setting: %d", currentWeight)
-	assert.Equal(t, uint16(150), currentWeight, "IO weight should be set to 150")
+	t.Logf("Child cgroup path: %s", cg.path)
 
-	// Restore the original weight
-	restoreIOWeightCgroup(returnedWeight)
+	// Verify child cgroup exists
+	info, err := os.Stat(cg.path)
+	assert.NoError(t, err, "Child cgroup should exist")
+	assert.True(t, info.IsDir(), "Child cgroup should be a directory")
 
-	// Verify the weight was restored
-	restoredWeight, err := readIOWeight()
-	if err != nil {
-		t.Fatalf("Failed to read IO weight after restoring: %v", err)
+	// Verify IO weight is set correctly on child cgroup
+	ioWeightPath := filepath.Join(cg.path, "io.weight")
+	data, err := os.ReadFile(ioWeightPath)
+	if err == nil {
+		t.Logf("Child cgroup io.weight: %s", strings.TrimSpace(string(data)))
+		// Expected: "default 1415" (BFQ 150 -> io.weight 1415)
+		expectedIOWeight := convertBFQToIOWeight(150)
+		assert.Contains(t, string(data), strconv.FormatUint(expectedIOWeight, 10),
+			"Child cgroup io.weight should be %d", expectedIOWeight)
 	}
 
-	t.Logf("IO weight after restoring: %d", restoredWeight)
-	assert.Equal(t, originalWeight, restoredWeight, "IO weight should be restored to the original value")
+	// Destroy the child cgroup
+	cg.destroy()
+
+	// Verify child cgroup is removed
+	_, err = os.Stat(cg.path)
+	assert.True(t, os.IsNotExist(err), "Child cgroup should be removed after destroy")
 }
 
 // TestRunWithIOWeightValueRealCgroup tests RunWithIOWeightValue with actual cgroup operations
@@ -366,5 +396,201 @@ func TestLocalRunWithIOWeightValueRealCgroup(t *testing.T) {
 	} else {
 		t.Logf("Final IO weight after test: %d (should be %d)", finalWeight, originalWeight)
 		assert.Equal(t, originalWeight, finalWeight, "Weight should be restored after LocalRunWithIOWeightValue")
+	}
+}
+
+// TestRunWithIOWeightValueChildCgroupIsolation tests that child cgroup IO weight
+// is isolated and doesn't affect the parent cgroup
+func TestRunWithIOWeightValueChildCgroupIsolation(t *testing.T) {
+	if !isCgroupV2Enabled() {
+		t.Skip("Test requires cgroups v2")
+	}
+
+	// Get original weight of parent cgroup
+	originalWeight, err := readIOWeight()
+	if err != nil {
+		t.Skipf("Cannot read IO weight: %v", err)
+	}
+	t.Logf("Parent cgroup original IO weight: %d", originalWeight)
+
+	// Get the original cgroup path for logging
+	originalCgroupPath, _ := getCurrentCgroupPath()
+	t.Logf("Original cgroup path: %s", originalCgroupPath)
+
+	// Test that we can create child cgroup
+	testCg, err := createIOWeightCgroup(100)
+	if err != nil {
+		t.Skipf("Cannot create child cgroup (need permissions): %v", err)
+	}
+	testCg.destroy()
+
+	// Channels for synchronization
+	insideReady := make(chan struct{})
+	outsideChecked := make(chan struct{})
+
+	testWeight := uint16(50)
+	var weightInFunction uint16
+	var childCgroupPath string
+
+	// Run in a goroutine so we can check parent cgroup while function is running
+	resultCh := make(chan error, 1)
+	go func() {
+		_, err := RunWithIOWeightValue(testWeight, func() (string, error) {
+			// Step 1: Read the IO weight inside the function (should be in child cgroup)
+			w, readErr := readIOWeight()
+			if readErr != nil {
+				return "", readErr
+			}
+			weightInFunction = w
+
+			// Get the child cgroup path for logging
+			path, _ := getCurrentCgroupPath()
+			childCgroupPath = path
+
+			// Step 2: Signal that we're ready and inside the child cgroup
+			close(insideReady)
+
+			// Step 3: Wait for outside to finish checking
+			<-outsideChecked
+
+			return "done", nil
+		})
+		resultCh <- err
+	}()
+
+	// Wait for function to be inside child cgroup
+	<-insideReady
+
+	// Step 4: Check that parent cgroup IO weight is unchanged
+	// Read directly from the saved original path to avoid thread confusion
+	parentWeight, err := readIOWeightFromPath(originalCgroupPath)
+	if err != nil {
+		t.Errorf("Failed to read parent cgroup weight: %v", err)
+	}
+
+	t.Logf("Child cgroup path: %s", childCgroupPath)
+	t.Logf("Weight inside child cgroup: %d (expected %d)", weightInFunction, testWeight)
+	t.Logf("Parent cgroup weight while child is running: %d (expected %d)", parentWeight, originalWeight)
+
+	// Verify child cgroup has correct weight (allow 1 for rounding error in BFQ <-> io.weight conversion)
+	diff := int(testWeight) - int(weightInFunction)
+	if diff < 0 {
+		diff = -diff
+	}
+	assert.LessOrEqual(t, diff, 1, "Child cgroup should have IO weight within 1 of %d", testWeight)
+
+	// Verify parent cgroup is unchanged (isolation)
+	assert.Equal(t, originalWeight, parentWeight, "Parent cgroup IO weight should be unchanged")
+
+	// Step 5: Signal that outside check is done
+	close(outsideChecked)
+
+	// Wait for function to complete
+	err = <-resultCh
+	assert.NoError(t, err)
+
+	// Verify parent weight is still unchanged after function completes
+	finalWeight, err := readIOWeightFromPath(originalCgroupPath)
+	if err == nil {
+		t.Logf("Parent cgroup weight after function completes: %d", finalWeight)
+		assert.Equal(t, originalWeight, finalWeight, "Parent cgroup should still have original weight")
+	}
+}
+
+// TestLocalRunWithIOWeightValueChildCgroupIsolation tests LocalRunWithIOWeightValue
+// with child cgroup isolation verification
+func TestLocalRunWithIOWeightValueChildCgroupIsolation(t *testing.T) {
+	if !isCgroupV2Enabled() {
+		t.Skip("Test requires cgroups v2")
+	}
+
+	// Get original weight of parent cgroup
+	originalWeight, err := readIOWeight()
+	if err != nil {
+		t.Skipf("Cannot read IO weight: %v", err)
+	}
+	t.Logf("Parent cgroup original IO weight: %d", originalWeight)
+
+	// Get the original cgroup path for logging
+	originalCgroupPath, _ := getCurrentCgroupPath()
+	t.Logf("Original cgroup path: %s", originalCgroupPath)
+
+	// Test that we can create child cgroup
+	testCg, err := createIOWeightCgroup(100)
+	if err != nil {
+		t.Skipf("Cannot create child cgroup (need permissions): %v", err)
+	}
+	testCg.destroy()
+
+	// Channels for synchronization
+	insideReady := make(chan struct{})
+	outsideChecked := make(chan struct{})
+
+	testWeight := uint16(75)
+	var weightInFunction uint16
+	var childCgroupPath string
+
+	// Run in a goroutine so we can check parent cgroup while function is running
+	resultCh := make(chan error, 1)
+	go func() {
+		_, err := LocalRunWithIOWeightValue(testWeight, func() (string, error) {
+			// Step 1: Read the IO weight inside the function (should be in child cgroup)
+			w, readErr := readIOWeight()
+			if readErr != nil {
+				return "", readErr
+			}
+			weightInFunction = w
+
+			// Get the child cgroup path for logging
+			path, _ := getCurrentCgroupPath()
+			childCgroupPath = path
+
+			// Step 2: Signal that we're ready and inside the child cgroup
+			close(insideReady)
+
+			// Step 3: Wait for outside to finish checking
+			<-outsideChecked
+
+			return "done", nil
+		})
+		resultCh <- err
+	}()
+
+	// Wait for function to be inside child cgroup
+	<-insideReady
+
+	// Step 4: Check that parent cgroup IO weight is unchanged
+	// Read directly from the saved original path to avoid thread confusion
+	parentWeight, err := readIOWeightFromPath(originalCgroupPath)
+	if err != nil {
+		t.Errorf("Failed to read parent cgroup weight: %v", err)
+	}
+
+	t.Logf("Child cgroup path: %s", childCgroupPath)
+	t.Logf("Weight inside child cgroup: %d (expected %d)", weightInFunction, testWeight)
+	t.Logf("Parent cgroup weight while child is running: %d (expected %d)", parentWeight, originalWeight)
+
+	// Verify child cgroup has correct weight (allow 1 for rounding error in BFQ <-> io.weight conversion)
+	diff := int(testWeight) - int(weightInFunction)
+	if diff < 0 {
+		diff = -diff
+	}
+	assert.LessOrEqual(t, diff, 1, "Child cgroup should have IO weight within 1 of %d", testWeight)
+
+	// Verify parent cgroup is unchanged (isolation)
+	assert.Equal(t, originalWeight, parentWeight, "Parent cgroup IO weight should be unchanged")
+
+	// Step 5: Signal that outside check is done
+	close(outsideChecked)
+
+	// Wait for function to complete
+	err = <-resultCh
+	assert.NoError(t, err)
+
+	// Verify parent weight is still unchanged after function completes
+	finalWeight, err := readIOWeightFromPath(originalCgroupPath)
+	if err == nil {
+		t.Logf("Parent cgroup weight after function completes: %d", finalWeight)
+		assert.Equal(t, originalWeight, finalWeight, "Parent cgroup should still have original weight")
 	}
 }
