@@ -50,6 +50,24 @@ const (
 
 	// sliceWaitInterval is the interval between retries
 	sliceWaitInterval = 100 * time.Millisecond
+
+	// BFQWeightMin is the minimum BFQ IO weight
+	BFQWeightMin uint16 = 10
+	// BFQWeightMax is the maximum BFQ IO weight
+	BFQWeightMax uint16 = 1000
+	// BFQWeightDefault is the default BFQ IO weight
+	BFQWeightDefault uint16 = 100
+
+	// IOWeightMin is the minimum io.weight value
+	IOWeightMin uint64 = 1
+	// IOWeightMax is the maximum io.weight value
+	IOWeightMax uint64 = 10000
+
+	// Conversion factors for BFQ <-> io.weight
+	// io.weight = 1 + (bfq - 10) * 9999 / 990
+	// bfq = 10 + (io.weight - 1) * 990 / 9999
+	conversionNumerator   = 9999
+	conversionDenominator = 990
 )
 
 var (
@@ -83,16 +101,15 @@ func Init(cfg Config, slicePath, sliceName string) error {
 
 	stateOnce.Do(func() {
 		s := &globalState{}
+		defer func() { state = s }()
 
 		if cfg.Weight == 0 {
 			log.L.Debug("blkiorun: disabled (weight=0)")
-			state = s
 			return
 		}
 
 		if cfg.Weight < BFQWeightMin || cfg.Weight > BFQWeightMax {
 			log.L.Warnf("blkiorun: weight %d out of range [%d, %d], disabled", cfg.Weight, BFQWeightMin, BFQWeightMax)
-			state = s
 			return
 		}
 
@@ -101,7 +118,6 @@ func Init(cfg Config, slicePath, sliceName string) error {
 
 		if !isCgroupV2() {
 			log.L.Warn("blkiorun: cgroups v2 not available, disabled")
-			state = s
 			return
 		}
 
@@ -110,7 +126,6 @@ func Init(cfg Config, slicePath, sliceName string) error {
 		s.containerdPath, err = getCurrentCgroupPath()
 		if err != nil {
 			initErr = fmt.Errorf("failed to get cgroup path: %w", err)
-			state = s
 			return
 		}
 		log.L.Debugf("blkiorun: containerd cgroup: %s", s.containerdPath)
@@ -133,7 +148,6 @@ func Init(cfg Config, slicePath, sliceName string) error {
 
 			if err := createSlice(ctx, sliceName); err != nil {
 				log.L.WithError(err).Warnf("blkiorun: failed to create slice %s", sliceName)
-				state = s
 				return
 			}
 
@@ -149,27 +163,23 @@ func Init(cfg Config, slicePath, sliceName string) error {
 		// Verify io.weight is available
 		if _, err := os.Stat(filepath.Join(cgroupPath, "io.weight")); os.IsNotExist(err) {
 			log.L.Warn("blkiorun: io.weight not available")
-			state = s
 			return
 		}
 
 		// Enable io controller for children
 		if err := enableIOController(cgroupPath); err != nil {
 			log.L.WithError(err).Warn("blkiorun: failed to enable io controller")
-			state = s
 			return
 		}
 
 		// Apply default IO weight to slice
 		if err := applyConfig(cgroupPath, cfg); err != nil {
 			log.L.WithError(err).Warn("blkiorun: failed to apply config")
-			state = s
 			return
 		}
 
 		s.slicePath = cgroupPath
 		s.initialized = true
-		state = s
 		log.L.Infof("blkiorun: initialized at %s with weight %d", cgroupPath, cfg.Weight)
 	})
 
@@ -421,4 +431,26 @@ func sliceCgroupPath(name string) string {
 		pp = append(pp, strings.Join(parts[:i], "-")+".slice")
 	}
 	return filepath.Join("/sys/fs/cgroup", filepath.Join(pp...))
+}
+
+// ConvertBFQToIOWeight converts BFQ weight (10-1000) to io.weight (1-10000).
+func ConvertBFQToIOWeight(bfqWeight uint16) uint64 {
+	if bfqWeight == 0 {
+		return 0
+	}
+	return uint64(IOWeightMin) + (uint64(bfqWeight)-uint64(BFQWeightMin))*conversionNumerator/conversionDenominator
+}
+
+// ConvertIOWeightToBFQ converts io.weight (1-10000) back to BFQ weight (10-1000).
+func ConvertIOWeightToBFQ(ioWeight uint64) uint16 {
+	if ioWeight == 0 {
+		return 0
+	}
+	if ioWeight <= IOWeightMin {
+		return BFQWeightMin
+	}
+	if ioWeight >= IOWeightMax {
+		return BFQWeightMax
+	}
+	return BFQWeightMin + uint16((ioWeight-IOWeightMin)*conversionDenominator/conversionNumerator)
 }
