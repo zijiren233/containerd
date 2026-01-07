@@ -240,10 +240,9 @@ func convertIOWeightToBFQ(ioWeight uint64) uint16 {
 	return uint16(10 + (ioWeight-1)*990/9999)
 }
 
-// setIOWeightCgroup sets the current process's cgroup to use configured IO weight.
+// setIOWeightCgroupValue sets the current process's cgroup to use the specified IO weight.
 // Returns the original weight value, or 0 if operation failed.
-func setIOWeightCgroup() uint16 {
-	weight := getConfiguredIOWeight()
+func setIOWeightCgroupValue(weight uint16) uint16 {
 	if weight == 0 {
 		return 0
 	}
@@ -253,7 +252,7 @@ func setIOWeightCgroup() uint16 {
 		return 0
 	}
 
-	// Set to configured weight
+	// Set to specified weight
 	_ = writeIOWeight(weight)
 	return origWeight
 }
@@ -266,12 +265,13 @@ func restoreIOWeightCgroup(weight uint16) {
 	_ = writeIOWeight(weight)
 }
 
-// RunWithIOWeight runs the given function in a dedicated OS thread
-// with configured IO weight via cgroup io.weight/io.bfq.weight.
+// RunWithIOWeightValue runs the given function in a dedicated OS thread
+// with the specified IO weight via cgroup io.weight/io.bfq.weight.
+// If weight is 0, the function runs without IO weight adjustment.
 // This function blocks until fn completes.
 // The dedicated OS thread is terminated after fn returns.
-func RunWithIOWeight[T any](fn func() (T, error)) (T, error) {
-	if getConfiguredIOWeight() == 0 {
+func RunWithIOWeightValue[T any](weight uint16, fn func() (T, error)) (T, error) {
+	if weight == 0 {
 		return fn()
 	}
 
@@ -286,8 +286,8 @@ func RunWithIOWeight[T any](fn func() (T, error)) (T, error) {
 		// we discard this OS thread after use
 		runtime.LockOSThread()
 
-		// Set configured IO weight via cgroups
-		_ = setIOWeightCgroup()
+		// Set specified IO weight via cgroups
+		_ = setIOWeightCgroupValue(weight)
 
 		v, err := fn()
 		resCh <- result{value: v, err: err}
@@ -297,9 +297,46 @@ func RunWithIOWeight[T any](fn func() (T, error)) (T, error) {
 	return res.value, res.err
 }
 
-// LocalRunWithIOWeight locks the current goroutine to its OS thread,
-// sets configured IO weight via cgroup io.weight/io.bfq.weight, runs the function,
+// RunWithIOWeight runs the given function in a dedicated OS thread
+// with configured IO weight from environment variable via cgroup io.weight/io.bfq.weight.
+// This function blocks until fn completes.
+// The dedicated OS thread is terminated after fn returns.
+func RunWithIOWeight[T any](fn func() (T, error)) (T, error) {
+	return RunWithIOWeightValue(getConfiguredIOWeight(), fn)
+}
+
+// LocalRunWithIOWeightValue locks the current goroutine to its OS thread,
+// sets the specified IO weight via cgroup io.weight/io.bfq.weight, runs the function,
 // restores the original IO weight, and then unlocks the thread.
+// If weight is 0, the function runs without IO weight adjustment.
+// This ensures the IO weight setting only affects the current goroutine
+// and doesn't leak to other goroutines that might later use the same thread.
+//
+// Use this when:
+// - You're already in a goroutine and want to run IO operations with specified weight
+// - You want to ensure other goroutines on the same thread aren't affected
+//
+// This function blocks until fn completes.
+//
+// For functions that return only an error, use: _, err := LocalRunWithIOWeightValue(...)
+func LocalRunWithIOWeightValue[T any](weight uint16, fn func() (T, error)) (T, error) {
+	if weight == 0 {
+		return fn()
+	}
+
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	// Set specified IO weight via cgroups and restore on exit
+	origWeight := setIOWeightCgroupValue(weight)
+	defer restoreIOWeightCgroup(origWeight)
+
+	return fn()
+}
+
+// LocalRunWithIOWeight locks the current goroutine to its OS thread,
+// sets configured IO weight from environment variable via cgroup io.weight/io.bfq.weight,
+// runs the function, restores the original IO weight, and then unlocks the thread.
 // This ensures the IO weight setting only affects the current goroutine
 // and doesn't leak to other goroutines that might later use the same thread.
 //
@@ -311,16 +348,5 @@ func RunWithIOWeight[T any](fn func() (T, error)) (T, error) {
 //
 // For functions that return only an error, use: _, err := LocalRunWithIOWeight(...)
 func LocalRunWithIOWeight[T any](fn func() (T, error)) (T, error) {
-	if getConfiguredIOWeight() == 0 {
-		return fn()
-	}
-
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-
-	// Set configured IO weight via cgroups and restore on exit
-	origWeight := setIOWeightCgroup()
-	defer restoreIOWeightCgroup(origWeight)
-
-	return fn()
+	return LocalRunWithIOWeightValue(getConfiguredIOWeight(), fn)
 }
