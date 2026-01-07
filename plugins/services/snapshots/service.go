@@ -31,6 +31,7 @@ import (
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/core/snapshots/proxy"
 	ptypes "github.com/containerd/containerd/v2/pkg/protobuf/types"
+	"github.com/containerd/containerd/v2/pkg/sys"
 	"github.com/containerd/containerd/v2/plugins"
 	"github.com/containerd/containerd/v2/plugins/services"
 )
@@ -148,7 +149,14 @@ func (s *service) Commit(ctx context.Context, cr *snapshotsapi.CommitSnapshotReq
 	if cr.Parent != "" {
 		opts = append(opts, snapshots.WithParent(cr.Parent))
 	}
-	if err := sn.Commit(ctx, cr.Name, cr.Key, opts...); err != nil {
+
+	// If low IO priority is globally enabled, run the commit operation
+	// in a dedicated OS thread with IOPRIO_CLASS_IDLE priority on Linux.
+	_, err = sys.RunWithIOWeight(func() (struct{}, error) {
+		return struct{}{}, sn.Commit(ctx, cr.Name, cr.Key, opts...)
+	})
+
+	if err != nil {
 		return nil, errgrpc.ToGRPC(err)
 	}
 

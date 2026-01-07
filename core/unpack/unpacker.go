@@ -14,6 +14,7 @@
    limitations under the License.
 */
 
+// Package unpack provides functionality for unpacking container images into snapshots.
 package unpack
 
 import (
@@ -45,6 +46,7 @@ import (
 	"github.com/containerd/containerd/v2/internal/cleanup"
 	"github.com/containerd/containerd/v2/internal/kmutex"
 	"github.com/containerd/containerd/v2/pkg/labels"
+	"github.com/containerd/containerd/v2/pkg/sys"
 	"github.com/containerd/containerd/v2/pkg/tracing"
 )
 
@@ -304,6 +306,10 @@ func (u *Unpacker) unpack(
 	config ocispec.Descriptor,
 	layers []ocispec.Descriptor,
 ) error {
+	// Note: We don't call SetLowIOPriority here because this function spawns
+	// goroutines that perform the actual IO operations. Each goroutine will
+	// set its own IO priority to avoid affecting other goroutines.
+
 	ctx := u.ctx
 	ctx, layerSpan := tracing.StartSpan(ctx, tracing.Name(unpackSpanPrefix, "unpack"))
 	defer layerSpan.End()
@@ -448,6 +454,8 @@ func (u *Unpacker) unpack(
 				fetchErr[i] = make(chan error, 1)
 			}
 			go func(i int) {
+				// Note: fetch() spawns its own goroutines for parallel downloads.
+				// Each of those goroutines will set its own IO priority.
 				err := u.fetch(ctx, h, layers[i:], fetchC)
 				if err != nil {
 					for _, fc := range fetchErr {
@@ -524,7 +532,9 @@ func (u *Unpacker) unpack(
 			case <-fetchC[i-fetchOffset]:
 			}
 
-			diff, err := a.Apply(ctx, desc, mounts, unpack.ApplyOpts...)
+			diff, err := sys.LocalRunWithIOWeight(func() (ocispec.Descriptor, error) {
+				return a.Apply(ctx, desc, mounts, unpack.ApplyOpts...)
+			})
 			if err != nil {
 				cleanup.Do(ctx, abort)
 				status.err = fmt.Errorf("failed to extract layer (%s %s) to %s as %q: %w", desc.MediaType, desc.Digest, unpack.SnapshotterKey, key, err)
@@ -666,7 +676,9 @@ func (u *Unpacker) fetch(ctx context.Context, h images.Handler, layers []ocispec
 				return err
 			}
 
-			_, err = h.Handle(ctx2, desc)
+			_, err = sys.LocalRunWithIOWeight(func() ([]ocispec.Descriptor, error) {
+				return h.Handle(ctx2, desc)
+			})
 
 			unlock()
 			u.release(u.limiter)

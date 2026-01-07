@@ -29,6 +29,7 @@ import (
 	"github.com/containerd/containerd/v2/core/remotes/docker"
 	"github.com/containerd/containerd/v2/core/transfer"
 	"github.com/containerd/containerd/v2/core/unpack"
+	"github.com/containerd/containerd/v2/pkg/sys"
 	"github.com/containerd/containerd/v2/pkg/tracing"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/platforms"
@@ -52,6 +53,15 @@ func (c *Client) Pull(ctx context.Context, ref string, opts ...RemoteOpt) (_ Ima
 		}
 	}
 
+	// If low IO priority is globally enabled, run the pull operation
+	// in a dedicated OS thread with IOPRIO_CLASS_IDLE priority.
+	return sys.RunWithIOWeight(func() (Image, error) {
+		return c.pull(ctx, ref, pullCtx, span)
+	})
+}
+
+// pull is the internal implementation of Pull that performs the actual work.
+func (c *Client) pull(ctx context.Context, ref string, pullCtx *RemoteContext, span *tracing.Span) (_ Image, retErr error) {
 	if resolver, ok := pullCtx.Resolver.(remotes.ResolverWithOptions); ok {
 		resolver.SetOptions(
 			transfer.WithConcurrentLayerFetchBuffer(pullCtx.ConcurrentLayerFetchBuffer),
