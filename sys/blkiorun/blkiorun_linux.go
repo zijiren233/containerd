@@ -192,7 +192,6 @@ func IsInitialized() bool {
 }
 
 // Go executes fn in a new goroutine with configured IO weight.
-// The OS thread is discarded after fn completes.
 func Go[T any](fn func() (T, error)) (T, error) {
 	return GoWithConfig(state.config, fn)
 }
