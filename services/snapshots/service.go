@@ -33,7 +33,7 @@ import (
 	"github.com/containerd/containerd/services"
 	"github.com/containerd/containerd/services/warning"
 	"github.com/containerd/containerd/snapshots"
-	"github.com/containerd/containerd/sys"
+	"github.com/containerd/containerd/sys/blkiorun"
 	"github.com/containerd/log"
 )
 
@@ -167,8 +167,8 @@ func (s *service) Commit(ctx context.Context, cr *snapshotsapi.CommitSnapshotReq
 		opts = append(opts, snapshots.WithLabels(cr.Labels))
 	}
 
-	// If IO weight is configured, run the commit operation in a dedicated OS thread.
-	_, err = sys.RunWithIOWeight(func() (struct{}, error) {
+	// Run with configured IO weight (if enabled)
+	_, err = blkiorun.Go(func() (struct{}, error) {
 		return struct{}{}, sn.Commit(ctx, cr.Name, cr.Key, opts...)
 	})
 

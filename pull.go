@@ -32,7 +32,7 @@ import (
 	"github.com/containerd/containerd/remotes"
 	"github.com/containerd/containerd/remotes/docker"
 	"github.com/containerd/containerd/remotes/docker/schema1" //nolint:staticcheck // Ignore SA1019. Need to keep deprecated package for compatibility.
-	"github.com/containerd/containerd/sys"
+	"github.com/containerd/containerd/sys/blkiorun"
 	"github.com/containerd/containerd/tracing"
 )
 
@@ -54,8 +54,8 @@ func (c *Client) Pull(ctx context.Context, ref string, opts ...RemoteOpt) (_ Ima
 		}
 	}
 
-	// If IO weight is configured, run the pull operation in a dedicated OS thread.
-	return sys.RunWithIOWeight(func() (Image, error) {
+	// Run with configured IO weight (if enabled)
+	return blkiorun.Go(func() (Image, error) {
 		return c.pull(ctx, ref, pullCtx, span)
 	})
 }
